@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>One-File Game Base (HTML + WASM-ready)</title>
+  <meta name="theme-color" content="#0b0b0b" />
+  <style>
+    /* --- Minimal styling --- */
+    html, body { height: 100%; margin: 0; background:#0b0b0b; color:#e8e8e8; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial; }
+    #wrap { display:grid; grid-template-rows: auto 1fr auto; height:100%; }
+    header, footer { padding: 8px 12px; }
+    header { display:flex; gap:12px; align-items:baseline; }
+    #hud { margin-left:auto; display:flex; gap:16px; font-variant-numeric: tabular-nums; }
+    .pill { background:#141414; border:1px solid #242424; padding:4px 8px; border-radius:999px; font-weight:600; }
+    .tip { opacity:.7; }
+    canvas { display:block; width:100%; height:100%; touch-action:none; }
+    button { background:#1d1d1d; color:#fff; border:1px solid #343434; border-radius:8px; padding:6px 10px; font:inherit; cursor:pointer; }
+    button:active { transform: translateY(1px); }
+    details { background:#0f0f0f; border:1px solid #222; border-radius:10px; padding:10px 12px; margin:8px 12px; }
+    code, pre { background:#0e0e0e; border:1px solid #222; border-radius:6px; padding:2px 6px; }
+    pre { overflow:auto; padding:10px; }
+    a { color:#9ad; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <header>
+      <span class="pill">One-File Game Base</span>
+      <span class="tip">Arrows / A,D to move • Click/drag for touch • Press ? for help</span>
+      <div id="hud">
+        <div>FPS: <b id="fps">0</b></div>
+        <div>Score: <b id="score">0</b></div>
+        <div>Best: <b id="best">0</b></div>
+        <button id="pauseBtn" aria-pressed="false">Pause</button>
+        <button id="resetBtn">Reset</button>
+      </div>
+    </header>
+
+    <canvas id="view" aria-label="Game canvas" role="img"></canvas>
+
+    <footer class="tip">&copy; You • Single-file • HTML + Web Audio + WASM-ready</footer>
+  </div>
+
+  <!--
+    ======================================================
+    README — "Vibe Coding" Base (keep it fun, ship tiny)
+    ======================================================
+    ▶ Philosophy
+      - Single file you can email or host anywhere.
+      - Procedural over assets. If you need assets, inline as data: URIs.
+      - Keep crossings between JS ↔ WASM chunky (few calls, big buffers).
+
+    ▶ How to use
+      1) Hack away in the systems below: input → simulate → render.
+      2) If using WASM, set WASM_BASE64 to your module’s Base64 on one line.
+      3) Implement wasmStep(...) in your language and export from WASM.
+      4) Run via a tiny HTTP server for best results (headers, perf).
+
+    ▶ Build tips
+      - Minify HTML/CSS/JS, run wasm-opt -Oz on your .wasm.
+      - Use seeded RNG for deterministic replays. Don’t read Date.now() in logic.
+      - Avoid per-frame allocations; prefer object pools & typed arrays.
+
+    ▶ Save data
+      - Small: localStorage. Big: IndexedDB. Always write-then-swap keys.
+
+    ▶ Debug
+      - Press `?` to toggle this README overlay at runtime.
+  -->
+
+  <details id="readme"><summary><b>README (click to expand)</b></summary>
+    <p><b>Vibe Coding Base:</b> single-file HTML with built-in loop, input, audio, saves, and WASM hooks.</p>
+    <ul>
+      <li>Everything lives here. No external files needed.</li>
+      <li>Use the <code>Game</code> object as your playground: add entities, systems.</li>
+      <li>Drop in your WASM by setting <code>WASM_BASE64</code> (see comments below).</li>
+      <li>Keep performance smooth with fixed-timestep simulation.</li>
+    </ul>
+    <pre>// JS ↔ WASM contract (suggested)
+wasm.exports = {
+  memory,               // (exported) WebAssembly.Memory
+  step(ptrIn, ptrOut),  // advance simulation by dt encoded in input buffer
+  init(seed),           // (optional) seed RNG or world
+};</pre>
+  </details>
+
+  <script type="module">
+    // =========================
+    // Config & Utilities
+    // =========================
+    const DPR = Math.max(1, Math.min(3, devicePixelRatio || 1));
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const lerp = (a, b, t) => a + (b - a) * t;
+    const rand = (a=0, b=1) => a + Math.random() * (b - a);
+
+    // =========================
+    // Canvas setup
+    // =========================
+    const canvas = document.getElementById('view');
+    const ctx = canvas.getContext('2d', { alpha:false, desynchronized:true });
+    function resize() {
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      canvas.width = Math.max(1, Math.floor(w * DPR));
+      canvas.height = Math.max(1, Math.floor(h * DPR));
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    }
+    new ResizeObserver(resize).observe(canvas);
+
+    // =========================
+    // Simple Web Audio beeps
+    // =========================
+    let audioCtx;
+    function beep(freq=660, dur=0.06, type='square', vol=0.05) {
+      try {
+        audioCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = type; o.frequency.value = freq;
+        g.gain.value = vol;
+        o.connect(g).connect(audioCtx.destination);
+        const t0 = audioCtx.currentTime;
+        o.start(t0);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+        o.stop(t0 + dur + 0.01);
+      } catch { /* ignore */ }
+    }
+
+    // =========================
+    // Input (keyboard, pointer)
+    // =========================
+    const keys = new Set();
+    addEventListener('keydown', e => {
+      if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','a','d','w','s',' '].includes(e.key)) e.preventDefault();
+      if (e.key === '?') document.getElementById('readme').open = !document.getElementById('readme').open;
+      keys.add(e.key);
+      if (!audioCtx) beep(220, 0.02, 'sine', 0.001); // unlock iOS audio
+    });
+    addEventListener('keyup', e => keys.delete(e.key));
+
+    const pointer = { active:false, x:0, y:0 };
+    canvas.addEventListener('pointerdown', e => { pointer.active = true; pointer.x = e.clientX; pointer.y = e.clientY; canvas.setPointerCapture(e.pointerId); });
+    canvas.addEventListener('pointermove', e => { if (pointer.active) { pointer.x = e.clientX; pointer.y = e.clientY; } });
+    canvas.addEventListener('pointerup',   e => { pointer.active = false; try { canvas.releasePointerCapture(e.pointerId); } catch {} });
+
+    // =========================
+    // Save system (localStorage)
+    // =========================
+    const SAVE_KEY = 'onefile-base-best';
+    const save = {
+      best: Number(localStorage.getItem(SAVE_KEY) || 0),
+      write(best) {
+        try { localStorage.setItem(SAVE_KEY + '.tmp', String(best));
+              localStorage.setItem(SAVE_KEY, String(best));
+              localStorage.removeItem(SAVE_KEY + '.tmp'); } catch {}
+      }
+    };
+
+    // =========================
+    // Game state & demo entities
+    // =========================
+    const state = {
+      running: true,
+      score: 0,
+      best: save.best,
+      player: { x: 160, y: 160, vx:0, vy:0, r:16 },
+      hazards: [],
+      lastSpawn: 0,
+      speed: 1,
+    };
+    const hud = {
+      fps: document.getElementById('fps'),
+      score: document.getElementById('score'),
+      best: document.getElementById('best'),
+      pauseBtn: document.getElementById('pauseBtn'),
+    };
+    hud.best.textContent = state.best;
+
+    document.getElementById('resetBtn').onclick = () => resetGame();
+    hud.pauseBtn.onclick = () => togglePause();
+
+    function togglePause() {
+      state.running = !state.running;
+      hud.pauseBtn.textContent = state.running ? 'Pause' : 'Resume';
+      hud.pauseBtn.setAttribute('aria-pressed', String(!state.running));
+      if (state.running) lastT = performance.now();
+    }
+    function resetGame() {
+      state.score = 0;
+      state.speed = 1;
+      state.hazards.length = 0;
+      state.player.x = canvas.clientWidth/2;
+      state.player.y = canvas.clientHeight/2;
+      state.player.vx = state.player.vy = 0;
+      state.running = true;
+      hud.pauseBtn.textContent = 'Pause';
+      hud.pauseBtn.setAttribute('aria-pressed', 'false');
+      lastT = performance.now();
+    }
+
+    // =========================
+    // WASM hook (optional)
+    // =========================
+    // Put your Base64-encoded .wasm below (single line). Leave empty to skip.
+    const WASM_BASE64 = ""; // TODO: replace with your Base64 to enable WASM
+    let wasm = null;
+    function b64ToBytes(b64) {
+      const bin = atob(b64);
+      const out = new Uint8Array(bin.length);
+      for (let i=0; i<bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+    async function initWasm() {
+      if (!WASM_BASE64) return null;
+      const bytes = b64ToBytes(WASM_BASE64);
+      const imports = {}; // add imports here if needed (e.g., env, js)
+      const { instance } = await WebAssembly.instantiate(bytes, imports);
+      return instance;
+    }
+    initWasm().then(inst => {
+      wasm = inst;
+      if (wasm?.exports?.init) wasm.exports.init((Math.random()*0xffffffff)>>>0);
+      console.log('WASM ready. Exports:', Object.keys(wasm.exports));
+    }).catch(err => console.warn('WASM init failed:', err));
+
+    // =========================
+    // Game loop (fixed timestep)
+    // =========================
+    const FIXED_DT = 1/60; // seconds
+    let acc = 0, lastT = performance.now(), frames = 0, fpsTimer = 0, fps = 0;
+
+    function loop(tNow) {
+      requestAnimationFrame(loop);
+      const dt = Math.min(0.25, (tNow - lastT) / 1000); // clamp to avoid spiral
+      lastT = tNow;
+      fpsTimer += dt; frames++;
+      if (fpsTimer >= 0.5) { fps = Math.round(frames / fpsTimer); frames = 0; fpsTimer = 0; hud.fps.textContent = fps; }
+
+      if (!state.running) return;
+      acc += dt;
+      while (acc >= FIXED_DT) {
+        update(FIXED_DT);
+        acc -= FIXED_DT;
+      }
+      render();
+    }
+    requestAnimationFrame(loop);
+
+    // =========================
+    // Update & Render
+    // =========================
+    function spawnHazard() {
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      state.hazards.push({
+        x: rand(20, w-20), y: -30, r: rand(10, 22),
+        vy: rand(120, 200) * state.speed, rot: rand(0, Math.PI), vr: rand(-2,2)
+      });
+    }
+
+    function update(dt) {
+      // Input → player velocity
+      const accel = 900, friction = 0.86;
+      if (keys.has('ArrowLeft') || keys.has('a'))  state.player.vx -= accel * dt;
+      if (keys.has('ArrowRight')|| keys.has('d'))  state.player.vx += accel * dt;
+      if (keys.has('ArrowUp')   || keys.has('w'))  state.player.vy -= accel * dt;
+      if (keys.has('ArrowDown') || keys.has('s'))  state.player.vy += accel * dt;
+
+      if (pointer.active) {
+        // simple attraction toward pointer
+        const tx = pointer.x, ty = pointer.y;
+        state.player.vx += (tx - state.player.x) * 0.02;
+        state.player.vy += (ty - state.player.y) * 0.02;
+      }
+
+      state.player.vx *= friction;
+      state.player.vy *= friction;
+      state.player.x = clamp(state.player.x + state.player.vx * dt, 16, canvas.clientWidth - 16);
+      state.player.y = clamp(state.player.y + state.player.vy * dt, 16, canvas.clientHeight - 16);
+
+      // Spawn hazards
+      state.lastSpawn += dt;
+      if (state.lastSpawn > Math.max(0.2, 0.8 - 0.015*state.score)) {
+        state.lastSpawn = 0;
+        spawnHazard();
+      }
+      // Move hazards
+      for (let i = state.hazards.length - 1; i >= 0; i--) {
+        const hz = state.hazards[i];
+        hz.y += hz.vy * dt;
+        hz.rot += hz.vr * dt;
+        if (hz.y - hz.r > canvas.clientHeight + 40) state.hazards.splice(i, 1);
+      }
+
+      // Collisions
+      for (const hz of state.hazards) {
+        const dx = hz.x - state.player.x, dy = hz.y - state.player.y;
+        const r = hz.r + state.player.r;
+        if (dx*dx + dy*dy < r*r) {
+          // hit
+          beep(180, 0.08, 'sawtooth', 0.1);
+          state.best = Math.max(state.best, state.score);
+          save.write(state.best);
+          state.score = 0;
+          state.hazards.length = 0;
+          state.speed = 1;
+          break;
+        }
+      }
+
+      // Score
+      state.score += dt * 2;
+      state.speed = 1 + state.score * 0.02;
+      hud.score.textContent = Math.floor(state.score);
+      hud.best.textContent = Math.floor(state.best);
+
+      // Optional: call WASM for heavy sim (if available)
+      if (wasm && wasm.exports?.step && wasm.exports?.memory) {
+        // Example: pass dt via an input buffer (first 4 bytes = f32 dt)
+        // This is a placeholder to show the intended pattern.
+        // const mem = new DataView(wasm.exports.memory.buffer);
+        // mem.setFloat32(0, dt, true);
+        // wasm.exports.step(0, 0);
+      }
+    }
+
+    function render() {
+      const w = canvas.width / DPR, h = canvas.height / DPR;
+      // background
+      ctx.fillStyle = '#0b0b0b';
+      ctx.fillRect(0, 0, w, h);
+
+      // player
+      ctx.save();
+      ctx.translate(state.player.x, state.player.y);
+      const grd = ctx.createRadialGradient(-6, -6, 4, 0, 0, state.player.r);
+      grd.addColorStop(0, '#fff');
+      grd.addColorStop(1, '#9bdcff');
+      ctx.fillStyle = grd;
+      ctx.beginPath(); ctx.arc(0, 0, state.player.r, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+
+      // hazards
+      ctx.strokeStyle = '#ff6';
+      ctx.lineWidth = 2;
+      for (const hz of state.hazards) {
+        ctx.save();
+        ctx.translate(hz.x, hz.y);
+        ctx.rotate(hz.rot);
+        ctx.beginPath();
+        ctx.moveTo(-hz.r, 0); ctx.lineTo(0, -hz.r); ctx.lineTo(hz.r, 0); ctx.lineTo(0, hz.r); ctx.closePath();
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    // Kick off initial sizing and center player
+    resize();
+    state.player.x = canvas.clientWidth/2;
+    state.player.y = canvas.clientHeight/2;
+  </script>
+</body>
+</html>
